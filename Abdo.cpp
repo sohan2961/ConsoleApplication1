@@ -16,20 +16,37 @@
 #define S3 2
 #define colorOut A2
 #define servoPin A5
+#define BATTERY_PIN A3  // Battery voltage analog input
+
 Servo scanServo;
-int servoPos = 50;                    
-bool sweepingRight = true;           
-unsigned long lastServoMoveTime = 0; 
+int servoPos = 50;
+bool sweepingRight = true;
+unsigned long lastServoMoveTime = 0;
 
-
-int forwardSpeed = 70;
-int turnSpeed = 50;
+int forwardSpeed = 150;
+int turnSpeed = 120;
 int approachThreshold = 15;  // cm
 int scanThreshold = 2.8;     // cm
 
 bool ultrasonicEnabled = true;
 bool approaching = false;
 String detectedColor = "UNKNOWN";
+
+// Voltage divider resistor values for battery voltage measurement
+const float R1 = 30000.0; // 30k ohms
+const float R2 = 10000.0; // 10k ohms
+
+// PID parameters
+float batterySetpoint = 7.4;  // Nominal battery voltage (adjust for your battery)
+float kp = 20.0;
+float ki = 0.1;
+float kd = 5.0;
+
+float integral = 0;
+float previousError = 0;
+unsigned long lastPIDTime = 0;
+
+float pidOutput = 0;  // PID correction output
 
 void setup() {
   Serial.begin(9600);
@@ -49,18 +66,25 @@ void setup() {
   pinMode(S2, OUTPUT);
   pinMode(S3, OUTPUT);
   pinMode(colorOut, INPUT);
+  pinMode(BATTERY_PIN, INPUT);
+
   digitalWrite(S0, HIGH);
   digitalWrite(S1, LOW);
 
   scanServo.attach(servoPin);
   scanServo.write(50);
   delay(300);
+  lastPIDTime = millis();
 }
 
 void loop() {
   int leftIR = digitalRead(L_S);
   int rightIR = digitalRead(R_S);
   int distance = ultrasonicEnabled ? getDistance() : 100;
+
+  // Read battery voltage and update PID output
+  float voltage = getBatteryVoltage();
+  pidOutput = calculatePID(voltage);
 
   // Servo scanning 
   if (millis() - lastServoMoveTime >= 100) {
@@ -100,8 +124,10 @@ void loop() {
       }
 
       int slowApproachSpeed = 120;
-      analogWrite(enA, slowApproachSpeed);
-      analogWrite(enB, slowApproachSpeed);
+      int pwmSlowA = adjustPWM(slowApproachSpeed, pidOutput);
+      int pwmSlowB = adjustPWM(slowApproachSpeed, pidOutput);
+      analogWrite(enA, pwmSlowA);
+      analogWrite(enB, pwmSlowB);
       forward();
       delay(100);
       Stop();
@@ -128,27 +154,29 @@ void loop() {
   Serial.print(" | R_IR=");
   Serial.print(rightIR);
   Serial.print(" | Distance=");
-  Serial.println(getDistance());
+  Serial.println(distance);
+  Serial.print(" | Battery V=");
+  Serial.println(voltage, 2);
 
   if ((leftIR == 0) && (rightIR == 0)) {
-    analogWrite(enA, forwardSpeed);
-    analogWrite(enB, forwardSpeed);
+    int pwmA = adjustPWM(forwardSpeed, pidOutput);
+    int pwmB = adjustPWM(forwardSpeed, pidOutput);
+    analogWrite(enA, pwmA);
+    analogWrite(enB, pwmB);
     forward();
   } else if ((leftIR == 0) && (rightIR == 1)) {
-    analogWrite(enA, turnSpeed);
-    analogWrite(enB, turnSpeed);
+    int pwmTurn = adjustPWM(turnSpeed, pidOutput);
+    analogWrite(enA, pwmTurn);
+    analogWrite(enB, pwmTurn);
     turnRight();
     delay(50);
-    //delay(100);
-    //forward();
     delay(50);
   } else if ((leftIR == 1) && (rightIR == 0)) {
-    analogWrite(enA, turnSpeed);
-    analogWrite(enB, turnSpeed);
+    int pwmTurn = adjustPWM(turnSpeed, pidOutput);
+    analogWrite(enA, pwmTurn);
+    analogWrite(enB, pwmTurn);
     delay(50);
     turnLeft();
-    //delay(100);
-    //forward();
     delay(50);
   } else {
     Stop();
@@ -156,7 +184,6 @@ void loop() {
 
   delay(50); // stability delay
 }
-
 
 int getDistance() {
   digitalWrite(trigPin, LOW);
@@ -167,6 +194,36 @@ int getDistance() {
   long duration = pulseIn(echoPin, HIGH, 20000);
   int distance = duration * 0.034 / 2;
   return distance;
+}
+
+float getBatteryVoltage() {
+  int sensorValue = analogRead(BATTERY_PIN);
+  float voltage = sensorValue * (5.0 / 1023.0) * ((R1 + R2) / R2);
+  return voltage;
+}
+
+float calculatePID(float currentVoltage) {
+  unsigned long now = millis();
+  float dt = (now - lastPIDTime) / 1000.0;
+  if (dt <= 0) dt = 0.01;
+
+  float error = batterySetpoint - currentVoltage;
+  integral += error * dt;
+  float derivative = (error - previousError) / dt;
+
+  float output = kp * error + ki * integral + kd * derivative;
+
+  previousError = error;
+  lastPIDTime = now;
+
+  return output;
+}
+
+int adjustPWM(int basePWM, float pidCorrection) {
+  int adjustedPWM = basePWM + (int)pidCorrection;
+  if (adjustedPWM > 255) adjustedPWM = 255;
+  if (adjustedPWM < 0) adjustedPWM = 0;
+  return adjustedPWM;
 }
 
 void readColor() {
@@ -205,10 +262,15 @@ void scanWithServo() {
   Serial.println("Returning to center...");
   delay(500);
 }
-void driveForward(int cm, int speed = forwardSpeed) {
+
+void driveForward(int cm, int speed = 70) {
   int t = cm * 30;
-  analogWrite(enA, speed);
-  analogWrite(enB, speed);
+  float voltage = getBatteryVoltage();
+  pidOutput = calculatePID(voltage);
+  int pwmA = adjustPWM(speed, pidOutput);
+  int pwmB = adjustPWM(speed, pidOutput);
+  analogWrite(enA, pwmA);
+  analogWrite(enB, pwmB);
   forward();
   delay(t);
   Stop();
@@ -217,8 +279,12 @@ void driveForward(int cm, int speed = forwardSpeed) {
 
 void driveBackwards(int cm) {
   int estimatedTime = cm * 30;
-  analogWrite(enA, forwardSpeed);
-  analogWrite(enB, forwardSpeed);
+  float voltage = getBatteryVoltage();
+  pidOutput = calculatePID(voltage);
+  int pwmA = adjustPWM(forwardSpeed, pidOutput);
+  int pwmB = adjustPWM(forwardSpeed, pidOutput);
+  analogWrite(enA, pwmA);
+  analogWrite(enB, pwmB);
   backward();
   delay(estimatedTime);
   Stop();
@@ -259,10 +325,15 @@ void Stop() {
   digitalWrite(in3, LOW);
   digitalWrite(in4, LOW);
 }
+
 void driveCurveLeft(int cm) {
   int t = cm * 30;
-  analogWrite(enA, forwardSpeed / 2);  // Left motor slower
-  analogWrite(enB, forwardSpeed);      // Right motor normal
+  float voltage = getBatteryVoltage();
+  pidOutput = calculatePID(voltage);
+  int pwmA = adjustPWM(forwardSpeed / 2, pidOutput);
+  int pwmB = adjustPWM(forwardSpeed, pidOutput);
+  analogWrite(enA, pwmA);  // Left motor slower
+  analogWrite(enB, pwmB);  // Right motor normal
   forward();
   delay(t);
   Stop();
@@ -270,21 +341,30 @@ void driveCurveLeft(int cm) {
 }
 
 void rotate180() {
-  analogWrite(enA, forwardSpeed);
-  analogWrite(enB, forwardSpeed);
+  float voltage = getBatteryVoltage();
+  pidOutput = calculatePID(voltage);
+  int pwmA = adjustPWM(forwardSpeed, pidOutput);
+  int pwmB = adjustPWM(forwardSpeed, pidOutput);
+  analogWrite(enA, pwmA);
+  analogWrite(enB, pwmB);
   turnLeft();  // Rotate in place
   delay(800); // wait till rotate 180° is Done
   Stop();
   delay(200);
 }
 
-
 void handleDetectedColor(String color) {
   if (color == "RED") {
     turnRight();
     delay(1000);
-    analogWrite(enA, forwardSpeed);
-    analogWrite(enB, forwardSpeed);
+    {
+      float voltage = getBatteryVoltage();
+      pidOutput = calculatePID(voltage);
+      int pwmA = adjustPWM(forwardSpeed, pidOutput);
+      int pwmB = adjustPWM(forwardSpeed, pidOutput);
+      analogWrite(enA, pwmA);
+      analogWrite(enB, pwmB);
+    }
     forward();
     delay(400); // 20 cm
     Stop();
@@ -306,20 +386,18 @@ void handleDetectedColor(String color) {
     delay(300);
   }
 
-  else if (color == "GREEN") { //working fine now (tested_Abdo)
-    //driveBackwards(20);
-    driveForward(40, 100);   
+  else if (color == "GREEN") {
+    driveForward(40, 100);
     Stop();
     delay(300);
     driveBackwards(60);
   }
 
 else if (color == "BLUE") {
-  // Step 1: Reverse 30 cm
-  driveBackwards(30);
-  driveCurveLeft(30);  
-  rotate180();
-  Serial.println("BLUE maneuver complete → Parked");
+    driveBackwards(30);
+    driveCurveLeft(30);
+    rotate180();
+    Serial.println("BLUE maneuver complete → Parked");
   while (true);  // Stay parked
 }
   else {
