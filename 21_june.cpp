@@ -1,331 +1,469 @@
-#include <Servo.h>
-#define enA 10
-#define in1 9
-#define in2 8
-#define in3 7
-#define in4 6
-#define enB 5
-#define L_S A4
-#define R_S A5
-#define trigPin 12
-#define echoPin 13
+// === Motor control pins ===
+const int mr1 = 2;  // Left motor IN1 (reversed wiring)
+const int mr2 = 3;  // Left motor IN2 (reversed wiring)
+const int ml1 = 4;  // Right motor IN1
+const int ml2 = 5;  // Right motor IN2
+
+// === Enable (PWM) pins ===
+const int enA = 6;
+const int enB = 9;
+
+// === Ultrasonic sensor pins ===
+const int trigPin = 8;
+const int echoPin = 7;
+
+float distance = 10;
+bool avoidingObstacle = false;
+
+unsigned long reengageStartTime = 0;
+bool reengageInProgress = false;
+
+// === IR sensor pins ===
+const int leftIR  = A0;
+const int rightIR = A1;
+
+// === Color sensor pins ===
 #define S0 A2
-#define S1 A1
-#define S2 0
-#define S3 1
-#define colorOut A0
-#define servoPin 4
-#define SERVO_CENTER 70
+#define S1 A3
+#define S2 A4
+#define S3 A5
+#define sensorOut 11
+#define OE 13
 
-Servo scanServo;
+// Color detection variables
+int redFrequency = 0;
+int greenFrequency = 0;
+int blueFrequency = 0;
 
-int forwardSpeed = 70;
-int turnSpeed = 80;
-int curveDelay = 150;
-int approachThreshold = 20;
-int scanThreshold = 3;
-int approachSpeed = 80;
-bool ultrasonicEnabled = true;
-bool approaching = false;
-String detectedColor = "UNKNOWN";
+int speedA = 70;
+int speedB = 70;
 
-void forward();
-void backward();
-void turnLeft();
-void turnRight();
-void Stop();
-void curveLeft();
-void curveRight();
-void approachToObstacle();
-void readColor();
-void handleDetectedColor(String color);
-void driveForward(int cm, int speed = 70);
-void driveBackwards(int cm, int speed = 70);
-void rotate90();
-void rotateRight90();
-void approachRightToLane();
-int getDistance();
+// === Speed control ===
+int add = 10;
+int sub = 15;
 
 void setup() {
-  Serial.begin(9600);
-  pinMode(R_S, INPUT); pinMode(L_S, INPUT);
+  pinMode(mr1, OUTPUT); pinMode(mr2, OUTPUT);
+  pinMode(ml1, OUTPUT); pinMode(ml2, OUTPUT);
   pinMode(enA, OUTPUT); pinMode(enB, OUTPUT);
-  pinMode(in1, OUTPUT); pinMode(in2, OUTPUT);
-  pinMode(in3, OUTPUT); pinMode(in4, OUTPUT);
+
+  pinMode(leftIR, INPUT); pinMode(rightIR, INPUT);
   pinMode(trigPin, OUTPUT); pinMode(echoPin, INPUT);
-  pinMode(S0, OUTPUT); pinMode(S1, OUTPUT);
-  pinMode(S2, OUTPUT); pinMode(S3, OUTPUT);
-  pinMode(colorOut, INPUT);
-  digitalWrite(S0, HIGH); digitalWrite(S1, LOW);
-  scanServo.attach(servoPin);
-  scanServo.write(SERVO_CENTER);
-  delay(300);
+
+  // Color sensor setup
+  pinMode(S0, OUTPUT);
+  pinMode(S1, OUTPUT);
+  pinMode(S2, OUTPUT);
+  pinMode(S3, OUTPUT);
+  pinMode(OE, OUTPUT);
+  pinMode(sensorOut, INPUT);
+  
+  // Initialize Output Enable (active low)
+  digitalWrite(OE, LOW);
+  
+  // Set frequency scaling to 20% (S0=HIGH, S1=LOW)
+  digitalWrite(S0, HIGH);
+  digitalWrite(S1, LOW);
+
+  Serial.begin(9600);
+  Serial.println("Robot with Color Detection Started");
 }
 
 void loop() {
-  int leftIR = digitalRead(L_S);
-  int rightIR = digitalRead(R_S);
-  int distance = getDistance();
+  distance = readUltrasonic();
 
-  Serial.print("L_IR="); Serial.print(leftIR);
-  Serial.print(" | R_IR="); Serial.print(rightIR);
-  Serial.print(" | Distance="); Serial.println(distance);
-
-  if (!approaching && distance > 0 && distance <= approachThreshold && leftIR == 0 && rightIR == 0) {
-    approaching = true;
-    Serial.println("Obstacle detected at " + String(distance) + "cm");
-    Stop(); delay(300);
-  }
-
-  if (approaching) {
-    approachToObstacle();
-    return;
-  }
-
-  if (distance > 0 && distance <= approachThreshold) {
-    Stop();
-    Serial.println("Obstacle ahead! Stopping.");
+  if (distance > 0 && distance <= 6) {
+    stopMotors();
     delay(500);
+    
+    // Perform color detection when obstacle is detected
+    String detectedColor = performColorDetection();
+    Serial.print("Final Color Decision: ");
+    Serial.println(detectedColor);
+    
+    // Handle obstacle based on color
+    if (detectedColor == "RED") {
+      Serial.println("RED detected - Performing manual overtaking");
+      avoidingObstacle = true;
+      handleObstacle();  // Your existing manual overtaking function
+    }
+    /*
+    else if (detectedColor == "GREEN") {
+      Serial.println("GREEN detected - Pushing through obstacle");
+      pushThroughObstacle();
+    }
+    */
+    else if (detectedColor == "BLUE") {
+      Serial.println("BLUE detected - Pushing through obstacle");
+      pushThroughObstacle();
+    }
+    else {
+      Serial.println("Unknown color - Default overtaking");
+      avoidingObstacle = true;
+      handleObstacle();  // Default behavior
+    }
     return;
   }
 
-  if (leftIR == 0 && rightIR == 0) {
-    analogWrite(enA, forwardSpeed);
-    analogWrite(enB, forwardSpeed);
-    forward();
-  } else if (leftIR == 1 && rightIR == 0) {
-    Stop(); delay(30);
-    curveLeft();
-  } else if (leftIR == 0 && rightIR == 1) {
-    curveRight();
-    Stop(); delay(30);
-  } else {
-    Stop();
-    delay(100);
+  // Normal line following logic
+  int left = digitalRead(leftIR);   // HIGH = black line
+  int right = digitalRead(rightIR);
+
+  Serial.print("Left IR: "); Serial.print(left);
+  Serial.print(" | Right IR: "); Serial.println(right);
+
+  if (left == 0 && right == 0) {
+    moveForward(speedA, speedB);
+  }
+  else if (left == 0 && right == 1) {
+    leftForward(80);
+    rightBackward(60);
+  }
+  else if (left == 1 && right == 0) {
+    leftBackward(60);
+    rightForward(80);
+  }
+  else {
+    stopMotors();
+  }
+  
+}
+
+// === Color Detection Functions ===
+
+String performColorDetection() {
+  Serial.println("Starting color detection - taking 10 readings...");
+  
+  // Arrays to store color counts
+  int redCount = 0;
+  int greenCount = 0;
+  int blueCount = 0;
+  int unknownCount = 0;
+  
+  // Take 10 readings with delay between each
+  for (int i = 0; i < 10; i++) {
+    String color = readSingleColor();
+    
+    Serial.print("Reading ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.println(color);
+    
+    // Count each color detection
+    if (color == "RED") {
+      redCount++;
+    }
+    else if (color == "GREEN") {
+      greenCount++;
+    }
+    else if (color == "BLUE") {
+      blueCount++;
+    }
+    else {
+      unknownCount++;
+    }
+    
+    delay(200);  // Wait between readings
+  }
+  
+  // Print results
+  Serial.print("Results - Red: ");
+  Serial.print(redCount);
+  Serial.print(", Green: ");
+  Serial.print(greenCount);
+  Serial.print(", Blue: ");
+  Serial.print(blueCount);
+  Serial.print(", Unknown: ");
+  Serial.println(unknownCount);
+  
+  // Determine final color based on majority vote
+  if (redCount >= greenCount && redCount >= blueCount && redCount >= 3) {
+    return "RED";
+  }
+  else if (greenCount >= redCount && greenCount >= blueCount && greenCount >= 3) {
+    return "GREEN";
+  }
+  else if (blueCount >= redCount && blueCount >= greenCount && blueCount >= 3) {
+    return "BLUE";
+  }
+  else {
+    return "UNKNOWN";
   }
 }
 
-void approachToObstacle() {
-  int l, r, d;
-  unsigned long stepTime = 30;
-  while (true) {
-    d = getDistance();
-    l = digitalRead(L_S); r = digitalRead(R_S);
-    if (l == 1 && r == 1) {
-      Serial.println("Lost line during approach! Aborting.");
-      Stop(); delay(300); ultrasonicEnabled = true; approaching = false; return;
+String readSingleColor() {
+  // Read Red frequency
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, LOW);
+  redFrequency = pulseIn(sensorOut, LOW);
+  
+  delay(50);
+  
+  // Read Green frequency
+  digitalWrite(S2, HIGH);
+  digitalWrite(S3, HIGH);
+  greenFrequency = pulseIn(sensorOut, LOW);
+  
+  delay(50);
+  
+  // Read Blue frequency
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, HIGH);
+  blueFrequency = pulseIn(sensorOut, LOW);
+  
+  delay(50);
+  
+  return detectColor();
+}
+
+String detectColor() {
+  // Check if object is actually present (minimum signal strength)
+  int totalSignal = redFrequency + greenFrequency + blueFrequency;
+  
+  // If total signal is too high, no object is present (only ambient light)
+  if (totalSignal > 3000) {
+    return "NO OBJECT";
+  }
+  
+  // If total signal is too low, sensor might be covered or malfunctioning
+  if (totalSignal < 100) {
+    return "SENSOR ERROR";
+  }
+  
+  // Calculate the difference between colors for better detection
+  int redGreenDiff = abs(redFrequency - greenFrequency);
+  int redBlueDiff = abs(redFrequency - blueFrequency);
+  int greenBlueDiff = abs(greenFrequency - blueFrequency);
+  
+  // Different thresholds for different colors
+  int minDifference = 15;
+  int greenMinDiff = 10;
+  
+  // Check if all colors are very similar first (white/gray object)
+  if (redGreenDiff < 8 && redBlueDiff < 8 && greenBlueDiff < 8) {
+    return "WHITE/GRAY";
+  }
+  
+  // Find the minimum frequency (strongest color signal)
+  int minFreq = min(redFrequency, min(greenFrequency, blueFrequency));
+  
+  // Enhanced GREEN detection logic
+  if (greenFrequency == minFreq) {
+    if ((redGreenDiff > greenMinDiff || greenBlueDiff > greenMinDiff)) {
+      if (greenFrequency < (redFrequency * 0.9) || greenFrequency < (blueFrequency * 0.9)) {
+        return "GREEN";
+      }
     }
-    if (d <= scanThreshold || d <= 0) break;
-    if (l == 0 && r == 0) {
-      analogWrite(enA, approachSpeed); analogWrite(enB, approachSpeed);
-      forward(); delay(stepTime); Stop();
-    } else if (l == 1 && r == 0) {
-      analogWrite(enA, 0); analogWrite(enB, approachSpeed);
-      digitalWrite(in1, LOW); digitalWrite(in2, LOW);
-      digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
-      delay(stepTime); Stop();
-    } else if (l == 0 && r == 1) {
-      analogWrite(enA, approachSpeed); analogWrite(enB, 0);
-      digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
-      digitalWrite(in3, LOW); digitalWrite(in4, LOW);
-      delay(stepTime); Stop();
+    if (greenFrequency < redFrequency && greenFrequency < blueFrequency) {
+      float greenAdvantage = ((float)(redFrequency + blueFrequency) / 2) / greenFrequency;
+      if (greenAdvantage > 1.05) {
+        return "GREEN";
+      }
+    }
+  }
+  
+  // RED detection
+  if (redFrequency == minFreq && redFrequency < greenFrequency && redFrequency < blueFrequency) {
+    if (redGreenDiff > minDifference && redBlueDiff > minDifference) {
+      if (redFrequency < (greenFrequency * 0.8) && redFrequency < (blueFrequency * 0.8)) {
+        return "RED";
+      }
+    }
+  }
+  
+  // BLUE detection
+  if (blueFrequency == minFreq && blueFrequency < redFrequency && blueFrequency < greenFrequency) {
+    if (redBlueDiff > minDifference && greenBlueDiff > minDifference) {
+      if (blueFrequency < (redFrequency * 0.8) && blueFrequency < (greenFrequency * 0.8)) {
+        return "BLUE";
+      }
+    }
+  }
+  
+  // Only use ratio detection if there's a significant color difference
+  int maxDiff = max(redGreenDiff, max(redBlueDiff, greenBlueDiff));
+  if (maxDiff > 20) {
+    float redRatio = (float)redFrequency / totalSignal;
+    float greenRatio = (float)greenFrequency / totalSignal;
+    float blueRatio = (float)blueFrequency / totalSignal;
+    
+    if (greenRatio < redRatio && greenRatio < blueRatio) {
+      if ((redRatio - greenRatio) > 0.05 && (blueRatio - greenRatio) > 0.05) {
+        return "GREEN";
+      }
+    }
+    else if (redRatio < greenRatio && redRatio < blueRatio) {
+      if ((greenRatio - redRatio) > 0.05 && (blueRatio - redRatio) > 0.05) {
+        return "RED";
+      }
+    }
+    else if (blueRatio < redRatio && blueRatio < greenRatio) {
+      if ((redRatio - blueRatio) > 0.05 && (greenRatio - blueRatio) > 0.05) {
+        return "BLUE";
+      }
+    }
+  }
+  
+  return "UNKNOWN";
+}
+
+// === New Obstacle Handling Functions ===
+
+void pushThroughObstacle() {
+  Serial.println("Pushing blue obstacle forward...");
+  
+  // Move forward with full power to push obstacle away
+  moveForward(100, 100);
+  delay(600);  // Push forward for 2 seconds
+  
+  stopMotors();
+  delay(300);
+  
+  Serial.println("Returning to original position...");
+  
+  // Move backward to return to original position
+  moveBackward(100, 100);
+  delay(600);  // Move back for 2 seconds
+  
+  stopMotors();
+  delay(300);
+  
+  Serial.println("Obstacle cleared! Resuming line following");
+}
+
+void stopForever() {
+  Serial.println("STOP SIGNAL DETECTED - ROBOT STOPPED PERMANENTLY");
+  while (true) {
+    stopMotors();
+    delay(1000);
+    // Robot will stay here forever
+  }
+}
+
+// === Original Movement Functions ===
+
+void moveForward(int speedVal1, int speedVal2) {
+  analogWrite(enA, speedVal1);
+  analogWrite(enB, speedVal2);
+
+  digitalWrite(mr1, LOW);
+  digitalWrite(mr2, HIGH);  // Left motor forward (reversed wiring)
+
+  digitalWrite(ml1, HIGH);
+  digitalWrite(ml2, LOW);   // Right motor forward
+}
+
+void moveBackward(int speedVal1, int speedVal2) {
+  analogWrite(enA, speedVal1);
+  analogWrite(enB, speedVal2);
+
+  digitalWrite(mr1, HIGH);
+  digitalWrite(mr2, LOW);  // Left motor backward (reversed wiring)
+
+  digitalWrite(ml1, LOW);
+  digitalWrite(ml2, HIGH);  // Right motor backward
+}
+
+void leftForward(int speedVal) {
+  analogWrite(enA, speedVal);
+  digitalWrite(mr1, LOW);
+  digitalWrite(mr2, HIGH);  // Left forward (reversed wiring)
+}
+
+void leftBackward(int speedVal) {
+  analogWrite(enA, speedVal);
+  digitalWrite(mr1, HIGH);
+  digitalWrite(mr2, LOW);  // Left backward (reversed wiring)
+}
+
+void rightForward(int speedVal) {
+  analogWrite(enB, speedVal);
+  digitalWrite(ml1, HIGH);
+  digitalWrite(ml2, LOW);  // Right forward
+}
+
+void rightBackward(int speedVal) {
+  analogWrite(enB, speedVal);
+  digitalWrite(ml1, LOW);
+  digitalWrite(ml2, HIGH);  // Right backward
+}
+
+void stopMotors() {
+  analogWrite(enA, 0);
+  analogWrite(enB, 0);
+
+  digitalWrite(mr1, LOW); digitalWrite(mr2, LOW);
+  digitalWrite(ml1, LOW); digitalWrite(ml2, LOW);
+}
+
+long readUltrasonic() {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH, 20000);  // Timeout after 20 ms (max ~3.4m)
+
+  if (duration == 0) return -1;  // No echo received
+  long distance = duration * 0.034 / 2;
+
+  if (distance > 300 || distance <= 0) return -1;  // Invalid range (>3m or <=0)
+  
+  return distance;  // Valid distance in cm
+}
+
+void handleObstacle() {
+  stopMotors(); delay(300);
+
+  moveBackward(80, 80); delay(500); stopMotors(); delay(300);
+  moveWithTurn(-180, 180); delay(180); stopMotors(); delay(300);
+  moveForward(65, 65); delay(1600); stopMotors(); delay(300);
+  moveWithTurn(200, -200); delay(280); stopMotors(); delay(300);
+  moveForward1(80); delay(300); 
+
+  waitForLineDetection();
+  avoidingObstacle = false;
+}
+
+void moveWithTurn(int leftSpeed, int rightSpeed) {
+  analogWrite(enA, abs(leftSpeed));
+  analogWrite(enB, abs(rightSpeed));
+
+  digitalWrite(mr1, leftSpeed >= 0 ? LOW : HIGH);
+  digitalWrite(mr2, leftSpeed >= 0 ? HIGH : LOW);
+
+  digitalWrite(ml1, rightSpeed >= 0 ? HIGH : LOW);
+  digitalWrite(ml2, rightSpeed >= 0 ? LOW : HIGH);
+}
+
+void waitForLineDetection() {
+  Serial.println("Searching for line...");
+  while (true) {
+    int l = digitalRead(leftIR);
+    int r = digitalRead(rightIR);
+
+    if (l == 1 || r == 1) {
+      Serial.println("Line detected!");
+      break;
+    } else {
+      moveForward1(50);
     }
     delay(10);
   }
-  Stop(); delay(300); readColor(); handleDetectedColor(detectedColor);
-  delay(500); approaching = false;
 }
 
-void readColor() {
-  unsigned int red, green, blue;
-  digitalWrite(S2, LOW); digitalWrite(S3, LOW); red = pulseIn(colorOut, LOW);
-  digitalWrite(S2, HIGH); digitalWrite(S3, HIGH); green = pulseIn(colorOut, LOW);
-  digitalWrite(S2, LOW); digitalWrite(S3, HIGH); blue = pulseIn(colorOut, LOW);
-  if (red < green && red < blue) detectedColor = "RED";
-  else if (green < red && green < blue) detectedColor = "GREEN";
-  else detectedColor = "OTHER";
-  Serial.print("R="); Serial.print(red);
-  Serial.print(" G="); Serial.print(green);
-  Serial.print(" B="); Serial.println(blue);
-  Serial.println("Detected Color: " + detectedColor);
-}
+void moveForward1(int speedVal) {
+  analogWrite(enA, speedVal);
+  analogWrite(enB, speedVal);
 
-void handleDetectedColor(String color) {
-  int colorScenarioSpeed = 80;
-  if (color == "RED") {
-    driveBackwards(12, colorScenarioSpeed);
-    scanServo.write(180); delay(400);
-    int leftDist = getDistance();
-    scanServo.write(SERVO_CENTER); delay(200);
-    if (leftDist > 20) {
-      ultrasonicEnabled = false;
-      rotate90(); delay(50);
-      driveForward(30, colorScenarioSpeed); delay(200);
-      rotateRight90(); delay(200);
-      driveForward(20, colorScenarioSpeed);
-      approachRightToLane();
-      ultrasonicEnabled = true;
-      Serial.println("RED: Path left is clear, performed left-right bypass.");
-    } else {
-      Serial.println("RED: Left not clear, only backed up and stopped.");
-    }
-    scanServo.write(SERVO_CENTER);
-    Stop();
-    Serial.println("RED scenario complete.");
-  } else if (color == "GREEN") {
-    Serial.println("GREEN scenario: Forward 40cm, then reverse 40cm on lane, ignore ultrasonic for 5s.");
-    driveForward(20, 150);
-    Stop(); delay(300);
-    driveBackwards(20, 70);
-    Stop(); delay(300);
-    ultrasonicEnabled = false;
-    unsigned long ignoreStart = millis();
-    Serial.println("Ultrasonic disabled for 5 seconds...");
-    while (millis() - ignoreStart < 5000) {
-      int l = digitalRead(L_S);
-      int r = digitalRead(R_S);
-      if (l == 0 && r == 0) {
-        analogWrite(enA, forwardSpeed);
-        analogWrite(enB, forwardSpeed);
-        forward();
-      } else if (l == 1 && r == 0) {
-        Stop(); delay(30);
-        curveLeft();
-      } else if (l == 0 && r == 1) {
-        curveRight();
-        Stop(); delay(30);
-      } else {
-        Stop();
-        delay(100);
-      }
-      delay(20);
-    }
-    ultrasonicEnabled = true;
-    Serial.println("Ultrasonic re-enabled, GREEN scenario complete: Lane reacquired.");
-    Stop();
-  } else {
-    Serial.println("OTHER COLOR scenario: Back 10cm, scan right/left, park if right is clear.");
-    driveBackwards(10, colorScenarioSpeed);
-    delay(200);
-    scanServo.write(0); delay(400);
-    int rightDist = getDistance();
-    scanServo.write(180); delay(400);
-    int leftDist = getDistance();
-    scanServo.write(SERVO_CENTER); delay(200);
-    Serial.print("Scan distances: Right="); Serial.print(rightDist); Serial.print(", Left="); Serial.println(leftDist);
-    if (rightDist > 20) {
-      rotateRight90(); delay(200);
-      Stop();
-      Serial.println("Parked to the right.");
-      while (1) { Stop(); }
-    } else {
-      Serial.println("Right not clear, not parking.");
-    }
-  }
-}
+  // Left motor forward
+  digitalWrite(mr1, LOW);
+  digitalWrite(mr2, HIGH);
 
-void approachRightToLane() {
-  int l, r;
-  int leftSpeed = 65;
-  int rightSpeed = 40;
-  while (true) {
-    l = digitalRead(L_S);
-    r = digitalRead(R_S);
-    if (l == 1 || r == 1) {
-      Stop();
-      delay(100);
-      Serial.println("ApproachRightToLane: Black detected, resuming normal lane following.");
-      break;
-    }
-    analogWrite(enA, leftSpeed);
-    analogWrite(enB, rightSpeed);
-    digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
-    digitalWrite(in3, LOW);  digitalWrite(in4, HIGH);
-    delay(120); Stop(); delay(5);
-  }
-  Stop();
-}
-
-void forward() {
-  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
-  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
-}
-
-void backward() {
-  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
-  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
-}
-
-void turnLeft() {
-  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
-  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
-}
-
-void turnRight() {
-  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
-  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
-}
-
-void Stop() {
-  digitalWrite(in1, LOW); digitalWrite(in2, LOW);
-  digitalWrite(in3, LOW); digitalWrite(in4, LOW);
-}
-
-void curveLeft() {
-  analogWrite(enA, turnSpeed);
-  analogWrite(enB, turnSpeed);
-  turnLeft();
-  delay(curveDelay);
-  Stop();
-}
-
-void curveRight() {
-  analogWrite(enA, turnSpeed);
-  analogWrite(enB, turnSpeed);
-  turnRight();
-  delay(curveDelay);
-  Stop();
-}
-
-void driveForward(int cm, int speed) {
-  int t = cm * 30;
-  analogWrite(enA, speed); analogWrite(enB, speed);
-  forward();
-  delay(t);
-  Stop(); delay(200);
-}
-
-void driveBackwards(int cm, int speed) {
-  int t = cm * 30;
-  analogWrite(enA, speed); analogWrite(enB, speed);
-  backward();
-  delay(t);
-  Stop(); delay(200);
-}
-
-void rotate90() {
-  int rotateSpeed = 100;
-  analogWrite(enA, rotateSpeed); analogWrite(enB, rotateSpeed);
-  digitalWrite(in1, LOW); digitalWrite(in2, HIGH);
-  digitalWrite(in3, LOW); digitalWrite(in4, HIGH);
-  delay(500);
-  Stop(); delay(200);
-}
-
-void rotateRight90() {
-  int rotateSpeed = 100;
-  analogWrite(enA, rotateSpeed); analogWrite(enB, rotateSpeed);
-  digitalWrite(in1, HIGH); digitalWrite(in2, LOW);
-  digitalWrite(in3, HIGH); digitalWrite(in4, LOW);
-  delay(500);
-  Stop(); delay(200);
-}
-
-int getDistance() {
-  if (!ultrasonicEnabled) return 1000;
-  digitalWrite(trigPin, LOW); delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH); delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-  long duration = pulseIn(echoPin, HIGH, 20000);
-  return duration * 0.034 / 2;
+  // Right motor forward
+  digitalWrite(ml1, HIGH);
+  digitalWrite(ml2, LOW);
 }
